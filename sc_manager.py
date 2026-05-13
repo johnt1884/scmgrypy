@@ -335,16 +335,22 @@ def get_crop_and_dimensions(video_path, timestamp_str):
     orig_w, orig_h = get_video_dimensions(video_path)
 
     try:
+        # Increase frames and limit for more reliable detection of pillar/letterboxes
         cmd = [
             "ffmpeg", "-noautorotate", "-ss", str(timestamp_str),
             "-i", os.path.abspath(video_path),
-            "-vframes", "5", "-vf", "cropdetect=round=2", "-f", "null", "-"
+            "-vframes", "24", "-vf", "cropdetect=limit=32:round=2", "-f", "null", "-"
         ]
         res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=20, text=True)
         crops = re.findall(r"crop=(\d+:\d+:\d+:\d+)", res.stderr)
         if crops:
-            crop_str = crops[-1]
-            w, h, x, y = map(int, crop_str.split(':'))
+            # Parse all unique crops and find the one with the smallest area (most aggressive crop)
+            parsed_crops = []
+            for c in set(crops):
+                w, h, x, y = map(int, c.split(':'))
+                parsed_crops.append((w * h, c, w, h))
+
+            _, crop_str, w, h = min(parsed_crops, key=lambda x: x[0])
 
             target_w, target_h = (THUMB_WIDTH_H, THUMB_HEIGHT_H) if w >= h else (THUMB_WIDTH_V, THUMB_HEIGHT_V)
 
