@@ -339,18 +339,14 @@ def get_crop_and_dimensions(video_path, timestamp_str):
         cmd = [
             "ffmpeg", "-noautorotate", "-ss", str(timestamp_str),
             "-i", os.path.abspath(video_path),
-            "-vframes", "24", "-vf", "cropdetect=limit=32:round=2", "-f", "null", "-"
+            "-vframes", "32", "-vf", "cropdetect=limit=40:round=2", "-f", "null", "-"
         ]
         res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=20, text=True)
         crops = re.findall(r"crop=(\d+:\d+:\d+:\d+)", res.stderr)
         if crops:
-            # Parse all unique crops and find the one with the smallest area (most aggressive crop)
-            parsed_crops = []
-            for c in set(crops):
-                w, h, x, y = map(int, c.split(':'))
-                parsed_crops.append((w * h, c, w, h))
-
-            _, crop_str, w, h = min(parsed_crops, key=lambda x: x[0])
+            # The last crop is usually the most complete as it is cumulative
+            crop_str = crops[-1]
+            w, h, x, y = map(int, crop_str.split(':'))
 
             target_w, target_h = (THUMB_WIDTH_H, THUMB_HEIGHT_H) if w >= h else (THUMB_WIDTH_V, THUMB_HEIGHT_V)
 
@@ -441,13 +437,15 @@ def is_valid_thumbnail(video_mtime, thumb_path):
 
     if STRICT_MODE:
         if not verify_jpeg_integrity(tp): return False
-        dims = get_image_dimensions(tp)
-        # Check against both possible targets
-        if not dims: return False
-        valid_h = (dims["width"] == THUMB_WIDTH_H and dims["height"] == THUMB_HEIGHT_H)
-        valid_v = (dims["width"] == THUMB_WIDTH_V and dims["height"] == THUMB_HEIGHT_V)
-        if not (valid_h or valid_v):
-            return False
+
+    dims = get_image_dimensions(tp)
+    # Always check against both possible targets to ensure they match requested size
+    if not dims: return False
+    valid_h = (dims["width"] == THUMB_WIDTH_H and dims["height"] == THUMB_HEIGHT_H)
+    valid_v = (dims["width"] == THUMB_WIDTH_V and dims["height"] == THUMB_HEIGHT_V)
+    if not (valid_h or valid_v):
+        return False
+
     return True
 
 def get_project_folders():
