@@ -44,6 +44,7 @@ THUMB_WIDTH_H = 323
 THUMB_HEIGHT_H = 176
 THUMB_WIDTH_V = 176
 THUMB_HEIGHT_V = 323
+CROP_LOGIC_VERSION = 2  # Increment this to force re-detection
 DB_FILE = "shortcut_db.txt"
 SPECIAL_FOLDERS = {"sc", "landscape", "landscape rotate", "edit", "thumbnails", "edit thumbnails"}
 CACHE_DB = "metadata_cache.db"
@@ -93,10 +94,27 @@ class MetadataCache:
                     mtime REAL,
                     duration REAL,
                     fps REAL,
-                    md5 TEXT
+                    md5 TEXT,
+                    target_w INTEGER,
+                    target_h INTEGER,
+                    crop_str TEXT,
+                    logic_version INTEGER
                 )
             """)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_metadata_path_mtime ON metadata(path, mtime)")
+            # Migration
+            try:
+                cursor = conn.execute("PRAGMA table_info(metadata)")
+                cols = [row[1] for row in cursor.fetchall()]
+                if 'target_w' not in cols:
+                    conn.execute("ALTER TABLE metadata ADD COLUMN target_w INTEGER")
+                if 'target_h' not in cols:
+                    conn.execute("ALTER TABLE metadata ADD COLUMN target_h INTEGER")
+                if 'crop_str' not in cols:
+                    conn.execute("ALTER TABLE metadata ADD COLUMN crop_str TEXT")
+                if 'logic_version' not in cols:
+                    conn.execute("ALTER TABLE metadata ADD COLUMN logic_version INTEGER")
+            except Exception: pass
 
     def get(self, path):
         path_str = os.path.abspath(path)
@@ -107,12 +125,12 @@ class MetadataCache:
         
         conn = self._get_conn()
         cursor = conn.execute(
-            "SELECT duration, fps, md5 FROM metadata WHERE path = ? AND mtime = ?",
+            "SELECT duration, fps, md5, target_w, target_h, crop_str, logic_version FROM metadata WHERE path = ? AND mtime = ?",
             (path_str, mtime)
         )
         return cursor.fetchone()
 
-    def set(self, path, duration=None, fps=None, md5=None):
+    def set(self, path, duration=None, fps=None, md5=None, target_w=None, target_h=None, crop_str=None, logic_version=None):
         path_str = os.path.abspath(path)
         try:
             mtime = os.path.getmtime(path)
@@ -120,16 +138,20 @@ class MetadataCache:
             return
             
         conn = self._get_conn()
-        cursor = conn.execute("SELECT duration, fps, md5 FROM metadata WHERE path = ?", (path_str,))
+        cursor = conn.execute("SELECT duration, fps, md5, target_w, target_h, crop_str, logic_version FROM metadata WHERE path = ?", (path_str,))
         existing = cursor.fetchone()
         
         final_dur = duration if duration is not None else (existing[0] if existing else None)
         final_fps = fps if fps is not None else (existing[1] if existing else None)
         final_md5 = md5 if md5 is not None else (existing[2] if existing else None)
+        final_tw = target_w if target_w is not None else (existing[3] if existing else None)
+        final_th = target_h if target_h is not None else (existing[4] if existing else None)
+        final_crop = crop_str if crop_str is not None else (existing[5] if existing else None)
+        final_lv = logic_version if logic_version is not None else (existing[6] if existing else None)
         
         conn.execute(
-            "INSERT OR REPLACE INTO metadata (path, mtime, duration, fps, md5) VALUES (?, ?, ?, ?, ?)",
-            (path_str, mtime, final_dur, final_fps, final_md5)
+            "INSERT OR REPLACE INTO metadata (path, mtime, duration, fps, md5, target_w, target_h, crop_str, logic_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (path_str, mtime, final_dur, final_fps, final_md5, final_tw, final_th, final_crop, final_lv)
         )
 
     def close(self):
@@ -333,30 +355,59 @@ def get_video_dimensions(video_path):
 def get_crop_and_dimensions(video_path, timestamp_str):
     """Detects black bars and returns crop filter and target dimensions."""
     orig_w, orig_h = get_video_dimensions(video_path)
+    if not orig_w: return None, THUMB_WIDTH_H, THUMB_HEIGHT_H
 
-    try:
-        # Increase frames and limit for more reliable detection of pillar/letterboxes
-        cmd = [
-            "ffmpeg", "-noautorotate", "-ss", str(timestamp_str),
-            "-i", os.path.abspath(video_path),
-            "-vframes", "32", "-vf", "cropdetect=limit=40:round=2", "-f", "null", "-"
-        ]
-        res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=20, text=True)
-        crops = re.findall(r"crop=(\d+:\d+:\d+:\d+)", res.stderr)
-        if crops:
-            # The last crop is usually the most complete as it is cumulative
-            crop_str = crops[-1]
-            w, h, x, y = map(int, crop_str.split(':'))
+    m = get_video_metadata(video_path)
+    duration = m.get("duration", 0)
 
-            target_w, target_h = (THUMB_WIDTH_H, THUMB_HEIGHT_H) if w >= h else (THUMB_WIDTH_V, THUMB_HEIGHT_V)
+    # Scan multiple points.
+    check_points = [timestamp_str]
+    if duration > 10:
+        check_points.extend([f"{duration * 0.25:.3f}", f"{duration * 0.75:.3f}"])
 
-            # If the crop is the same as the original, don't return a crop filter
-            if orig_w == w and orig_h == h:
-                return None, target_w, target_h
+    # Union of all non-black areas
+    final_x1, final_y1, final_x2, final_y2 = float('inf'), float('inf'), -1, -1
+    found_any = False
 
-            return f"crop={crop_str}", target_w, target_h
-    except Exception as e:
-        logger.error(f"Crop detection failed for {video_path}: {e}")
+    for ts in set(check_points):
+        try:
+            # Use bbox to find the absolute bounds of content. min_val=24 to ignore noise.
+            cmd = [
+                "ffmpeg", "-noautorotate", "-ss", str(ts),
+                "-i", os.path.abspath(video_path),
+                "-vframes", "15", "-vf", "bbox=min_val=24", "-f", "null", "-"
+            ]
+            res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=20, text=True)
+            # bbox output format: x1:110 x2:212 y1:0 y2:175
+            matches = re.findall(r"x1:(\d+)\s+x2:(\d+)\s+y1:(\d+)\s+y2:(\d+)", res.stderr)
+            for x1, x2, y1, y2 in matches:
+                x1, x2, y1, y2 = int(x1), int(x2), int(y1), int(y2)
+                if x2 < x1 or y2 < y1: continue
+                final_x1 = min(final_x1, x1)
+                final_y1 = min(final_y1, y1)
+                final_x2 = max(final_x2, x2)
+                final_y2 = max(final_y2, y2)
+                found_any = True
+        except Exception as e:
+            logger.error(f"BBox detection failed at {ts} for {video_path}: {e}")
+
+    if found_any:
+        cw = final_x2 - final_x1 + 1
+        ch = final_y2 - final_y1 + 1
+        # Round to even for FFmpeg compatibility
+        cw = (cw // 2) * 2
+        ch = (ch // 2) * 2
+        cx = (final_x1 // 2) * 2
+        cy = (final_y1 // 2) * 2
+
+        crop_str = f"{cw}:{ch}:{cx}:{cy}"
+        target_w, target_h = (THUMB_WIDTH_H, THUMB_HEIGHT_H) if cw >= ch else (THUMB_WIDTH_V, THUMB_HEIGHT_V)
+
+        # If it happens to be exactly original size, we can return None
+        if cw >= orig_w - 2 and ch >= orig_h - 2:
+            return None, target_w, target_h
+
+        return f"crop={crop_str}", target_w, target_h
 
     # Fallback using original dimensions
     if orig_w and orig_h:
@@ -367,14 +418,28 @@ def get_crop_and_dimensions(video_path, timestamp_str):
 
     return None, THUMB_WIDTH_H, THUMB_HEIGHT_H
 
-def build_thumbnail_command(video_path, thumb_path, timestamp_str):
+def get_cached_crop_info(video_path, timestamp_str=None):
+    cached = cache.get(video_path)
+    if cached and cached[3] is not None and cached[6] == CROP_LOGIC_VERSION:
+        return cached[5], cached[3], cached[4]
+
+    if timestamp_str is None:
+        m = get_video_metadata(video_path)
+        timestamp_str = "00:00:02.000" if m['duration'] > 4.0 else f"{m['duration'] * 0.5:.4f}"
+
+    crop, tw, th = get_crop_and_dimensions(video_path, timestamp_str)
+    cache.set(video_path, target_w=tw, target_h=th, crop_str=crop, logic_version=CROP_LOGIC_VERSION)
+    return crop, tw, th
+
+def build_thumbnail_command(video_path, thumb_path, timestamp_str, crop_filter=None, target_w=None, target_h=None):
     """
     FFmpeg command optimized for speed and reliability:
     - Input-related flags (-noautorotate, -ss, -err_detect, etc.) MUST be BEFORE -i
     - setparams filter used to normalize colorspace for FFmpeg 7+ compatibility
     - yuvj420p for MJPEG compatibility
     """
-    crop_filter, target_w, target_h = get_crop_and_dimensions(video_path, timestamp_str)
+    if crop_filter is None or target_w is None or target_h is None:
+        crop_filter, target_w, target_h = get_cached_crop_info(video_path, timestamp_str)
 
     # Normalize colorspace metadata to avoid "Invalid color space" errors in FFmpeg 7+
     csp_fix = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
@@ -426,7 +491,7 @@ def get_edit_thumbnail_timestamp(duration, fps, index):
 
     return f"{max(start, min(ts, end)):.4f}"
 
-def is_valid_thumbnail(video_mtime, thumb_path):
+def is_valid_thumbnail(video_mtime, thumb_path, expected_w=None, expected_h=None):
     tp = Path(thumb_path)
     if not tp.exists(): return False
     try:
@@ -439,12 +504,17 @@ def is_valid_thumbnail(video_mtime, thumb_path):
         if not verify_jpeg_integrity(tp): return False
 
     dims = get_image_dimensions(tp)
-    # Always check against both possible targets to ensure they match requested size
     if not dims: return False
-    valid_h = (dims["width"] == THUMB_WIDTH_H and dims["height"] == THUMB_HEIGHT_H)
-    valid_v = (dims["width"] == THUMB_WIDTH_V and dims["height"] == THUMB_HEIGHT_V)
-    if not (valid_h or valid_v):
-        return False
+
+    if expected_w and expected_h:
+        if dims["width"] != expected_w or dims["height"] != expected_h:
+            return False
+    else:
+        # Fallback if expected dimensions aren't provided
+        valid_h = (dims["width"] == THUMB_WIDTH_H and dims["height"] == THUMB_HEIGHT_H)
+        valid_v = (dims["width"] == THUMB_WIDTH_V and dims["height"] == THUMB_HEIGHT_V)
+        if not (valid_h or valid_v):
+            return False
 
     return True
 
@@ -614,24 +684,30 @@ def check_thumbnails():
         for v in videos:
             vp = v['path']
             vm = v['mtime']
+            m = get_video_metadata(vp)
+            ts_reg = "00:00:02.000" if m['duration'] > 4.0 else f"{m['duration'] * 0.5:.4f}"
+
+            crop_filter, target_w, target_h = get_cached_crop_info(vp, ts_reg)
+
             rp = rt_dir / f"{vp.stem}.jpg"
-            if not is_valid_thumbnail(vm, rp): issues["MissingRegular"].append(vp)
+            if not is_valid_thumbnail(vm, rp, target_w, target_h):
+                issues["MissingRegular"].append((vp, crop_filter, target_w, target_h, ts_reg))
             
             valid_indices = set()
 
             if et_dir.exists():
                 for thumb in et_dir.glob(f"{vp.stem}_*.jpg"):
-                    m = re.match(
+                    res_m = re.match(
                         rf'^{re.escape(vp.stem)}_(\d+)\.jpg$',
                         thumb.name
                     )
 
-                    if not m:
+                    if not res_m:
                         continue
 
-                    idx = int(m.group(1))
+                    idx = int(res_m.group(1))
 
-                    if 1 <= idx <= 10 and is_valid_thumbnail(vm, thumb):
+                    if 1 <= idx <= 10 and is_valid_thumbnail(vm, thumb, target_w, target_h):
                         valid_indices.add(idx)
 
             missing_edit_indices = [
@@ -639,7 +715,7 @@ def check_thumbnails():
                 if i not in valid_indices
             ]
             
-            if missing_edit_indices: issues["MissingEdit"].append((vp, missing_edit_indices))
+            if missing_edit_indices: issues["MissingEdit"].append((vp, missing_edit_indices, crop_filter, target_w, target_h))
 
         if rt_dir.is_dir():
             for t in rt_dir.glob("*.jpg"):
@@ -650,17 +726,15 @@ def check_thumbnails():
 
         if issues["MissingRegular"]:
             rt_dir.mkdir(parents=True, exist_ok=True)
-            for vp in issues["MissingRegular"]:
-                m = get_video_metadata(vp)
-                ts = "00:00:02.000" if m['duration'] > 4.0 else f"{m['duration'] * 0.5:.4f}"
-                fix_commands.append(build_thumbnail_command(vp, rt_dir / f"{vp.stem}.jpg", ts))
+            for vp, crop, tw, th, ts in issues["MissingRegular"]:
+                fix_commands.append(build_thumbnail_command(vp, rt_dir / f"{vp.stem}.jpg", ts, crop, tw, th))
         if issues["MissingEdit"]:
             et_dir.mkdir(parents=True, exist_ok=True)
-            for vp, indices in issues["MissingEdit"]:
+            for vp, indices, crop, tw, th in issues["MissingEdit"]:
                 m = get_video_metadata(vp)
                 for i in indices:
                     ts = get_edit_thumbnail_timestamp(m["duration"], m["fps"], i - 1)
-                    fix_commands.append(build_thumbnail_command(vp, et_dir / f"{vp.stem}_{i}.jpg", ts))
+                    fix_commands.append(build_thumbnail_command(vp, et_dir / f"{vp.stem}_{i}.jpg", ts, crop, tw, th))
         for t in issues["Obsolete"]: fix_commands.append(["rm", str(t)])
         
         c = len(issues["MissingRegular"]) + len(issues["MissingEdit"]) + len(issues["Obsolete"])
@@ -702,23 +776,24 @@ def update_new_thumbnails():
             for v in new:
                 vp = v['path']
                 vm = v['mtime']
+                m = get_video_metadata(vp)
+                ts_reg = "00:00:02.000" if m['duration'] > 4.0 else f"{m['duration'] * 0.5:.4f}"
+                crop_filter, target_w, target_h = get_cached_crop_info(vp, ts_reg)
+
                 rp = rt_dir / f"{vp.stem}.jpg"
-                if not is_valid_thumbnail(vm, rp):
+                if not is_valid_thumbnail(vm, rp, target_w, target_h):
                     need_rt = True
-                    m = get_video_metadata(vp)
-                    ts = "00:00:02.000" if m['duration'] > 4.0 else f"{m['duration'] * 0.5:.4f}"
-                    project_cmds.append(build_thumbnail_command(vp, rp, ts))
+                    project_cmds.append(build_thumbnail_command(vp, rp, ts_reg, crop_filter, target_w, target_h))
                 
                 missing_indices = []
                 for i in range(1, 11):
                     tp = et_dir / f"{vp.stem}_{i}.jpg"
-                    if not is_valid_thumbnail(vm, tp): missing_indices.append(i)
+                    if not is_valid_thumbnail(vm, tp, target_w, target_h): missing_indices.append(i)
                 if missing_indices:
                     need_et = True
-                    m = get_video_metadata(vp)
                     for i in missing_indices:
                         ts = get_edit_thumbnail_timestamp(m["duration"], m["fps"], i - 1)
-                        project_cmds.append(build_thumbnail_command(vp, et_dir / f"{vp.stem}_{i}.jpg", ts))
+                        project_cmds.append(build_thumbnail_command(vp, et_dir / f"{vp.stem}_{i}.jpg", ts, crop_filter, target_w, target_h))
             
             if need_rt: rt_dir.mkdir(parents=True, exist_ok=True)
             if need_et: et_dir.mkdir(parents=True, exist_ok=True)
