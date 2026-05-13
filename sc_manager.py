@@ -377,12 +377,13 @@ def build_thumbnail_command(video_path, thumb_path, timestamp_str):
     # Normalize colorspace metadata to avoid "Invalid color space" errors in FFmpeg 7+
     csp_fix = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
 
-    scale_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=lanczos,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
+    # Fill target by scaling up then cropping to exact size
+    fill_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase:flags=lanczos,crop={target_w}:{target_h}"
 
     filters = [csp_fix]
     if crop_filter:
         filters.append(crop_filter)
-    filters.append(scale_filter)
+    filters.append(fill_filter)
 
     full_filter = ",".join(filters)
     
