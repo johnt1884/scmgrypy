@@ -40,8 +40,10 @@ def check_dependencies():
 
 # --- CONFIGURATION ---
 VIDEO_EXTENSIONS = (".mp4", ".avi", ".mov", ".mkv")
-THUMB_WIDTH = 256
-THUMB_HEIGHT = 256
+THUMB_WIDTH_H = 323
+THUMB_HEIGHT_H = 176
+THUMB_WIDTH_V = 176
+THUMB_HEIGHT_V = 323
 DB_FILE = "shortcut_db.txt"
 SPECIAL_FOLDERS = {"sc", "landscape", "landscape rotate", "edit", "thumbnails", "edit thumbnails"}
 CACHE_DB = "metadata_cache.db"
@@ -50,7 +52,6 @@ USE_CACHE = True
 STRICT_MODE = False
 LOG_FILE = "sc_manager.log"
 
-THUMB_FILTER = f"scale={THUMB_WIDTH}:{THUMB_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos"
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
@@ -314,6 +315,56 @@ def get_md5_parallel(paths):
         results = list(executor.map(lambda p: get_md5(p, USE_CACHE), paths))
     return results
 
+def get_video_dimensions(video_path):
+    try:
+        cmd = [
+            "ffprobe", "-v", "error", "-select_streams", "v:0",
+            "-show_entries", "stream=width,height",
+            "-of", "csv=s=x:p=0", str(video_path)
+        ]
+        res = subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=10)
+        dim_str = res.decode('utf-8').strip()
+        if 'x' in dim_str:
+            w, h = map(int, dim_str.split('x'))
+            return w, h
+    except Exception: pass
+    return None, None
+
+def get_crop_and_dimensions(video_path, timestamp_str):
+    """Detects black bars and returns crop filter and target dimensions."""
+    orig_w, orig_h = get_video_dimensions(video_path)
+
+    try:
+        cmd = [
+            "ffmpeg", "-noautorotate", "-ss", str(timestamp_str),
+            "-i", os.path.abspath(video_path),
+            "-vframes", "5", "-vf", "cropdetect=round=2", "-f", "null", "-"
+        ]
+        res = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.DEVNULL, timeout=20, text=True)
+        crops = re.findall(r"crop=(\d+:\d+:\d+:\d+)", res.stderr)
+        if crops:
+            crop_str = crops[-1]
+            w, h, x, y = map(int, crop_str.split(':'))
+
+            target_w, target_h = (THUMB_WIDTH_H, THUMB_HEIGHT_H) if w >= h else (THUMB_WIDTH_V, THUMB_HEIGHT_V)
+
+            # If the crop is the same as the original, don't return a crop filter
+            if orig_w == w and orig_h == h:
+                return None, target_w, target_h
+
+            return f"crop={crop_str}", target_w, target_h
+    except Exception as e:
+        logger.error(f"Crop detection failed for {video_path}: {e}")
+
+    # Fallback using original dimensions
+    if orig_w and orig_h:
+        if orig_w >= orig_h:
+            return None, THUMB_WIDTH_H, THUMB_HEIGHT_H
+        else:
+            return None, THUMB_WIDTH_V, THUMB_HEIGHT_V
+
+    return None, THUMB_WIDTH_H, THUMB_HEIGHT_H
+
 def build_thumbnail_command(video_path, thumb_path, timestamp_str):
     """
     FFmpeg command optimized for speed and reliability:
@@ -321,9 +372,19 @@ def build_thumbnail_command(video_path, thumb_path, timestamp_str):
     - setparams filter used to normalize colorspace for FFmpeg 7+ compatibility
     - yuvj420p for MJPEG compatibility
     """
+    crop_filter, target_w, target_h = get_crop_and_dimensions(video_path, timestamp_str)
+
     # Normalize colorspace metadata to avoid "Invalid color space" errors in FFmpeg 7+
     csp_fix = "setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709"
-    full_filter = f"{csp_fix},{THUMB_FILTER}"
+
+    scale_filter = f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease:flags=lanczos,pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
+
+    filters = [csp_fix]
+    if crop_filter:
+        filters.append(crop_filter)
+    filters.append(scale_filter)
+
+    full_filter = ",".join(filters)
     
     return [
         "ffmpeg", "-y", "-threads", "1", 
@@ -334,7 +395,7 @@ def build_thumbnail_command(video_path, thumb_path, timestamp_str):
         "-i", os.path.abspath(video_path), 
         "-map", "0:v:0", "-an", "-vframes", "1", 
         "-vf", full_filter,
-        "-pix_fmt", "yuvj420p", "-map_metadata", "-1",
+        "-pix_fmt", "yuvj444p", "-map_metadata", "-1",
         os.path.abspath(thumb_path)
     ]
 
@@ -374,7 +435,11 @@ def is_valid_thumbnail(video_mtime, thumb_path):
     if STRICT_MODE:
         if not verify_jpeg_integrity(tp): return False
         dims = get_image_dimensions(tp)
-        if not dims or dims["width"] > THUMB_WIDTH or dims["height"] > THUMB_HEIGHT:
+        # Check against both possible targets
+        if not dims: return False
+        valid_h = (dims["width"] == THUMB_WIDTH_H and dims["height"] == THUMB_HEIGHT_H)
+        valid_v = (dims["width"] == THUMB_WIDTH_V and dims["height"] == THUMB_HEIGHT_V)
+        if not (valid_h or valid_v):
             return False
     return True
 
